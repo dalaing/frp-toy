@@ -9,6 +9,7 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE InstanceSigs #-}
+{-# OPTIONS_GHC -fdefer-type-errors #-}
 module Scratch where
 
 import Control.Applicative ((<|>))
@@ -43,12 +44,15 @@ import qualified Data.Set as Set
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 
-import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef (IORef, newIORef, readIORef, atomicModifyIORef')
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
 import Control.Concurrent.STM.TMVar
+
+import Data.Constraint
+import Control.Exception
+import System.IO.Unsafe
 
 {-# NOINLINE nextNodeIdRef #-}
 nextNodeIdRef :: IORef Int
@@ -95,6 +99,20 @@ mkNodeInfo a ns = unsafePerformIO $ do
 
 class HasAnn k where
   getAnn :: k -> [NodeInfo IORef]
+
+-- Thanks (?) to
+-- https://gist.github.com/jkarni/0872c83bc4264a23fec1
+-- via
+-- https://gist.github.com/Icelandjack/5afdaa32f41adf3204ef9025d9da2a70
+getAnn' :: a -> [NodeInfo IORef]
+getAnn' y = unsafePerformIO $ do
+    res <- try $ evaluate $ getAnn'' Dict y
+    case res of
+      Right x -> return x
+      Left (TypeError _) -> return []
+
+getAnn'' :: (Dict (HasAnn a)) -> a -> [NodeInfo IORef]
+getAnn'' Dict x = getAnn x
 
 data EventF (f :: * -> *) a where
   ENever :: NodeInfo f -> EventF f a
@@ -150,11 +168,11 @@ instance Functor (BehaviorF IORef) where
   fmap f b = BFmap (mkNodeInfo b (getAnn b)) f b
 
 instance Applicative (BehaviorF IORef) where
-  pure x = BPure (mkNodeInfo x []) x
+  pure x = BPure (mkNodeInfo x (getAnn' x)) x
   (<*>) b1 b2 = BAp (mkNodeInfo (b1, b2) (getAnn b1 ++ getAnn b2)) b1 b2
 
 hold :: a -> Event a -> Behavior a
-hold i e = BHold (mkNodeInfo (i, e) (getAnn e)) i e
+hold i e = BHold (mkNodeInfo (i, e) (getAnn' i ++ getAnn e)) i e
 
 instance HasAnn (BehaviorF IORef a) where
   getAnn (BPure a _) = pure a
@@ -169,10 +187,11 @@ boom =
     eBuzz = "Buzz" <$ ffilter (\x -> x `mod` 5 == 0) eInt
     eSwitch1 = (* 3) <$> eInt
     eSwitch2 = (* 5) <$> eInt
-    beSwitch = hold (mkNR never) $
+    beSwitch = hold (mkNR never) .
+               fmap (fmap ($ False)) $
                mergeWith const
-                 (mkNR eSwitch1 <$ eFizz)
-                 (mkNR eSwitch2 <$ eBuzz)
+                 (distribute (\n -> mkNR eSwitch1) <$ eFizz)
+                 (distribute (\n -> mkNR eSwitch2) <$ eBuzz)
   in
     switch beSwitch
 
@@ -200,6 +219,9 @@ instance Distributive Ref where
 
 data NodeRef f a = NodeRef (NodeInfo f) a
   deriving (Eq, Show)
+
+instance HasAnn (Ref (NodeRef IORef a)) where
+  getAnn (Ref (NodeRef n _)) = [n]
 
 instance Functor (NodeRef f) where
   fmap f (NodeRef n x) = NodeRef n (f x)
